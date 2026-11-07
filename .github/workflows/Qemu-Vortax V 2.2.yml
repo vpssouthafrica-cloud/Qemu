@@ -714,6 +714,8 @@ jobs:
           sudo pkill -9 qemu || true
           if [[ "$UPLOAD_QCOW2" == "yes" && -n "$MEGA_EMAIL" ]]; then
  
+            echo "::add-mask::$MEGA_EMAIL"
+            echo "::add-mask::$MEGA_PASSWORD"
             DATE=$(date +%d-%m-%Y)
             echo "Compressing QCOW2 file to 7z..."
             sudo 7z a -t7z -mx=5 "/mnt/${VM}-${DATE}.7z" "/mnt/${VM}.qcow2"
@@ -727,8 +729,6 @@ jobs:
             echo "[Login]" > .megarc
             echo "Username = $MEGA_EMAIL" >> .megarc
             echo "Password = $MEGA_PASSWORD" >> .megarc
-            echo "MEGA.email = $MEGA_EMAIL"
-            echo "MEGA.Password = $MEGA_PASSWORD"
             sudo cp .megarc /root/.megarc
             sudo cp .megarc /mnt
             sudo megals > /dev/null 2>&1 || true
@@ -738,6 +738,7 @@ jobs:
             sudo megaput "$TARGET_PATH" --path /Root
             echo "getting the download link"
             DOWNLOAD_LINK=$(sudo megaexport /Root/"${TARGET_FILE}" 2>/dev/null | grep -Eo 'https://mega\.nz/[^ ]+' | tail -n1)
+            [ -n "$DOWNLOAD_LINK" ] && echo "::add-mask::$DOWNLOAD_LINK"
             echo "Download link: $DOWNLOAD_LINK"
             if [ -n "$DOWNLOAD_LINK" ]; then
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
@@ -759,6 +760,7 @@ jobs:
           WF="${{ github.workflow }}"
           REF="${{ github.ref_name }}"
           LINK="${DOWNLOAD_LINK:-}"
+          [ -n "$LINK" ] && echo "::add-mask::$LINK"
           SC="${{ github.event.inputs.system_choice }}"
           BP="${{ github.event.inputs.boot_mode }}"
           SU="${{ github.event.inputs.source_url }}"
