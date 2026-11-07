@@ -583,6 +583,30 @@ jobs:
             echo "$PROTOCOL (Bore): $TUNNEL_IP"
           fi
 
+          ADDR="${TUNNEL_URL:-$TUNNEL_IP}"
+          if [ -n "$ADDR" ]; then
+            {
+              echo "Program: $PROTOCOL"
+              echo "Address: $ADDR"
+              echo "Username: $USERNAME"
+              echo "Password: $PASSWORD"
+              echo "VNC password: ${{ github.event.inputs.vnc_password }}"
+            } > connection.txt
+            echo "### Connection" >> $GITHUB_STEP_SUMMARY
+            echo "- **$PROTOCOL:** \`$ADDR\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Username:** \`$USERNAME\`  **Password:** \`$PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **VNC password:** \`${{ github.event.inputs.vnc_password }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload connection info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection
+          path: connection.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: Connection Information and Keep Alive
         run: |
           echo "Thanks to MR.English2008 for this perfect work"
