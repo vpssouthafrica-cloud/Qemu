@@ -43,9 +43,14 @@ on:
         description: 'Upload QCOW2 file to Mega: yes or no'
         required: true
         default: 'yes'
+      public_port:
+        description: 'Guest port to expose publicly (blank = none, e.g. 8080)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   setup-and-run:
@@ -403,7 +408,12 @@ jobs:
           MNT_PATH="/mnt"
           ISO_PATH="$HOME_PATH/${VM}.iso"
           DISK_PATH="$MNT_PATH/${VM}.qcow2"
-          
+
+          PUBPORT="${{ github.event.inputs.public_port }}"
+          NETDEV="user,id=net0"
+          if [ -n "$PUBPORT" ]; then NETDEV="$NETDEV,hostfwd=tcp::${PUBPORT}-:${PUBPORT}"; fi
+          echo "Public port: ${PUBPORT:-none}"
+
           wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_CODE.fd -O OVMF_CODE.fd
           wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_VARS.fd -O OVMF_VARS.fd
           CODE_PATH=./OVMF_CODE.fd
@@ -430,7 +440,7 @@ jobs:
                 -vnc :0,password=on \
                 -monitor tcp:localhost:4444,server,nowait \
                 -display none \
-                -netdev user,id=net0 \
+                -netdev "$NETDEV" \
                 -device e1000,netdev=net0 \
                 -device usb-ehci,id=ehci \
                 -device usb-tablet,bus=ehci.0 \
@@ -450,7 +460,7 @@ jobs:
                 -vnc :0,password=on \
                 -monitor tcp:localhost:4444,server,nowait \
                 -display none \
-                -netdev user,id=net0 \
+                -netdev "$NETDEV" \
                 -device e1000,netdev=net0 \
                 -device usb-ehci,id=ehci \
                 -device usb-tablet,bus=ehci.0 \
@@ -471,7 +481,7 @@ jobs:
                 -vnc :0,password=on \
                 -monitor tcp:localhost:4444,server,nowait \
                 -display none \
-                -netdev user,id=net0 \
+                -netdev "$NETDEV" \
                 -device e1000,netdev=net0 \
                 -device usb-ehci,id=ehci \
                 -device usb-tablet,bus=ehci.0 \
@@ -489,7 +499,7 @@ jobs:
                 -vnc :0,password=on \
                 -monitor tcp:localhost:4444,server,nowait \
                 -display none \
-                -netdev user,id=net0 \
+                -netdev "$NETDEV" \
                 -device e1000,netdev=net0 \
                 -device usb-ehci,id=ehci \
                 -device usb-tablet,bus=ehci.0 \
@@ -583,6 +593,21 @@ jobs:
             echo "$PROTOCOL (Bore): $TUNNEL_IP"
           fi
 
+          PUBPORT="${{ github.event.inputs.public_port }}"
+          PUBURL=""
+          if [ -n "$PUBPORT" ] && [ "$PUBPORT" != "$PORT" ]; then
+            echo "Starting public tunnel for port $PUBPORT ..."
+            nohup bore local $PUBPORT --to bore.pub > bore_pub_log.log 2>&1 &
+            sleep 5
+            PUBURL=$(grep -Eo 'bore\.pub:[0-9]+' bore_pub_log.log | tail -n1)
+            if [ -n "$PUBURL" ]; then
+              echo "PUBLIC_URL=$PUBURL" >> $GITHUB_ENV
+              echo "Public server: $PUBURL"
+            else
+              echo "::warning::Could not get public address for port $PUBPORT"
+            fi
+          fi
+
           ADDR="${TUNNEL_URL:-$TUNNEL_IP}"
           if [ -n "$ADDR" ]; then
             {
@@ -591,11 +616,13 @@ jobs:
               echo "Username: $USERNAME"
               echo "Password: $PASSWORD"
               echo "VNC password: ${{ github.event.inputs.vnc_password }}"
+              echo "Public server: ${PUBURL:-none}"
             } > connection.txt
             echo "### Connection" >> $GITHUB_STEP_SUMMARY
             echo "- **$PROTOCOL:** \`$ADDR\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Username:** \`$USERNAME\`  **Password:** \`$PASSWORD\`" >> $GITHUB_STEP_SUMMARY
             echo "- **VNC password:** \`${{ github.event.inputs.vnc_password }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Public server:** \`${PUBURL:-none}\`" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Upload connection info
@@ -655,9 +682,12 @@ jobs:
           VM="${{ github.event.inputs.vm_name }}"
           MNT_PATH="/mnt"
 
+          if [ -n "$PUBLIC_URL" ]; then
+            echo ">>> Public server: $PUBLIC_URL"
+          fi
           echo "Keeping the session alive for ${RUNTIME} minutes..."
-          if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 325 ]]; then
-              RUNTIME=325
+          if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 270 ]]; then
+              RUNTIME=270
           fi
           sleep $((RUNTIME * 60))
           echo "Session ended after ${RUNTIME} minutes."
@@ -668,11 +698,11 @@ jobs:
           UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
           VM="${{ github.event.inputs.vm_name }}"
           sudo pkill -9 qemu || true
-          if [[ "$UPLOAD_QCOW2" == "yes" ]]; then
+          if [[ "$UPLOAD_QCOW2" == "yes" && -n "$MEGA_EMAIL" ]]; then
  
             DATE=$(date +%d-%m-%Y)
             echo "Compressing QCOW2 file to 7z..."
-            sudo 7z a -t7z -mx=9 "/mnt/${VM}-${DATE}.7z" "/mnt/${VM}.qcow2"
+            sudo 7z a -t7z -mx=5 "/mnt/${VM}-${DATE}.7z" "/mnt/${VM}.qcow2"
       
             echo "Starting upload using MegaTools..."
             TARGET_FILE="${VM}-${DATE}.7z"
@@ -685,15 +715,63 @@ jobs:
             echo "Password = $MEGA_PASSWORD" >> .megarc
             echo "MEGA.email = $MEGA_EMAIL"
             echo "MEGA.Password = $MEGA_PASSWORD"
-            megals > /dev/null 2>&1
-            echo " list /mnt files "
-            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.iso$' | awk '{split($5,size,""); if($5 ~ /G/){print $9, $5} else {printf "%s %.2fG\n", $9, $5/1024/1024/1024}}'
+            sudo cp .megarc /root/.megarc
             sudo cp .megarc /mnt
+            sudo megals > /dev/null 2>&1 || true
+            echo " list /mnt files "
+            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.iso$' | awk '{print $9, $5}'
             echo " uploading qcow2 file to mega"
-            sudo megaput "/mnt/${VM}-${DATE}.7z" --path /Root
+            sudo megaput "$TARGET_PATH" --path /Root
             echo "getting the download link"
-            DOWNLOAD_LINK=$(sudo megaexport /Root/"${VM}-${DATE}.7z")
+            DOWNLOAD_LINK=$(sudo megaexport /Root/"${TARGET_FILE}" 2>/dev/null | grep -Eo 'https://mega\.nz/[^ ]+' | tail -n1)
             echo "Download link: $DOWNLOAD_LINK"
+            if [ -n "$DOWNLOAD_LINK" ]; then
+              echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
+              echo "$DOWNLOAD_LINK" > disk_link.txt
+            else
+              echo "::warning::No MEGA download link produced - persistence will restart from scratch."
+            fi
           else
-            echo "Skipped uploading Compressed QCOW2 file."
+            echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, mega_account=${MEGA_EMAIL:-missing})."
+          fi
+
+      - name: Trigger next machine (loop)
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          WF="${{ github.workflow }}"
+          REF="${{ github.ref_name }}"
+          LINK="${DOWNLOAD_LINK:-}"
+          SC="${{ github.event.inputs.system_choice }}"
+          BP="${{ github.event.inputs.boot_mode }}"
+          SU="${{ github.event.inputs.source_url }}"
+          PP="${{ github.event.inputs.public_port }}"
+          echo "Auto-loop: dispatching '$WF' (link=${LINK:-none})"
+          ARGS=(workflow run "$WF" --repo "${{ github.repository }}" --ref "$REF"
+            -f "vm_name=${{ github.event.inputs.vm_name }}"
+            -f "runtime=${{ github.event.inputs.runtime }}"
+            -f "connection_method=${{ github.event.inputs.connection_method }}"
+            -f "connection_program=${{ github.event.inputs.connection_program }}"
+            -f "bios_mode=${{ github.event.inputs.bios_mode }}"
+            -f "vnc_password=${{ github.event.inputs.vnc_password }}"
+            -f "upload_qcow2=${{ github.event.inputs.upload_qcow2 }}")
+          [ -n "$PP" ] && ARGS+=(-f "public_port=$PP")
+          if [ -n "$LINK" ]; then
+            ARGS+=(-f "boot_mode=qcow2" -f "source_url=$LINK")
+          else
+            ARGS+=(-f "boot_mode=$BP")
+            [ -n "$SC" ] && ARGS+=(-f "system_choice=$SC")
+            [ -n "$SU" ] && ARGS+=(-f "source_url=$SU")
+          fi
+          gh "${ARGS[@]}" 2>&1 | tee dispatch.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -eq 0 ]; then
+            echo "::notice title=Auto-loop::Next machine queued - it starts when this run ends."
+            { echo ""; echo "## Auto-loop"; echo "Next machine queued. It starts when this run finishes."; } >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::warning title=Auto-loop failed::Could not dispatch the next run (exit $rc). Set Settings > Actions > General > Workflow permissions to Read and write."
+            { echo ""; echo "## Auto-loop FAILED"; echo "Could not dispatch the next run (exit $rc). Set Settings > Actions > General > Workflow permissions to Read and write."; } >> $GITHUB_STEP_SUMMARY
           fi
