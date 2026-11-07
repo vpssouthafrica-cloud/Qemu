@@ -68,6 +68,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          echo "Disk before cleanup:"
+          df -h / /mnt 2>/dev/null || df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/microsoft \
+            /usr/local/aws-cli /usr/local/aws-sam-cli /opt/az /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/Java_* /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/go /opt/hostedtoolcache/Ruby /opt/hostedtoolcache/php || true
+          sudo docker system prune -af --volumes > /dev/null 2>&1 || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup:"
+          df -h / /mnt 2>/dev/null || df -h /
+
       - name: Prepare user and sudo
         run: |
           echo "Setting password for user..."
@@ -765,6 +779,12 @@ jobs:
             ARGS+=(-f "boot_mode=$BP")
             [ -n "$SC" ] && ARGS+=(-f "system_choice=$SC")
             [ -n "$SU" ] && ARGS+=(-f "source_url=$SU")
+          fi
+          VM="${{ github.event.inputs.vm_name }}"
+          if [ -z "$LINK" ] && [ ! -f "/mnt/${VM}.qcow2" ] && [ ! -f "$HOME/${VM}.iso" ]; then
+            echo "::warning title=Auto-loop stopped::No disk/image was produced this run, so the next run would fail the same way. Not dispatching."
+            { echo ""; echo "## Auto-loop stopped"; echo "No disk/image was produced this run, so the next run would fail the same way. Not dispatching."; } >> $GITHUB_STEP_SUMMARY
+            exit 0
           fi
           gh "${ARGS[@]}" 2>&1 | tee dispatch.log
           rc=${PIPESTATUS[0]}
