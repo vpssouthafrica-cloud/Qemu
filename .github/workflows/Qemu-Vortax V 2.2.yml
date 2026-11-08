@@ -718,48 +718,75 @@ jobs:
           
       - name: Compressing and uploading the QCOW2 file
         if: always()
+        continue-on-error: true
         run: |
           UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
           VM="${{ github.event.inputs.vm_name }}"
           sudo pkill -9 qemu || true
           if [[ "$UPLOAD_QCOW2" == "yes" && -n "$MEGA_EMAIL" ]]; then
- 
+
             echo "::add-mask::$MEGA_EMAIL"
             echo "::add-mask::$MEGA_PASSWORD"
             DATE=$(date +%Y%m%d-%H%M)
-            echo "Compressing QCOW2 file to 7z..."
-            sudo 7z a -t7z -mx=5 "/mnt/${VM}-${DATE}.7z" "/mnt/${VM}.qcow2"
-      
-            echo "Starting upload using MegaTools..."
             TARGET_FILE="${VM}-${DATE}.7z"
             TARGET_PATH="/mnt/$TARGET_FILE"
-            
+            echo "Compressing QCOW2 file to 7z..."
+            sudo 7z a -t7z -mx=5 "$TARGET_PATH" "/mnt/${VM}.qcow2"
+
             echo "Setting up MegaTools configuration file..."
-            touch .megarc
-            echo "[Login]" > .megarc
-            echo "Username = $MEGA_EMAIL" >> .megarc
-            echo "Password = $MEGA_PASSWORD" >> .megarc
+            printf '[Login]\nUsername = %s\nPassword = %s\n' "$MEGA_EMAIL" "$MEGA_PASSWORD" > .megarc
             sudo cp .megarc /root/.megarc
             sudo cp .megarc /mnt
-            sudo megals > /dev/null 2>&1 || true
+
+            mega_retry() {
+              local n=1
+              until "$@"; do
+                if [ "$n" -ge 4 ]; then return 1; fi
+                echo "MEGA call failed (attempt $n) - retrying in $((n*45))s..."
+                sleep $((n*45))
+                n=$((n+1))
+              done
+            }
+
             echo " list /mnt files "
-            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.iso$' | awk '{print $9, $5}'
+            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.iso$' | awk '{print $9, $5}' || true
             echo " uploading qcow2 file to mega"
-            sudo megaput "$TARGET_PATH" --path /Root
-            echo "getting the download link"
-            DOWNLOAD_LINK=$(sudo megaexport /Root/"${TARGET_FILE}" 2>/dev/null | grep -Eo 'https://mega\.nz/[^ ]+' | tail -n1)
-            [ -n "$DOWNLOAD_LINK" ] && echo "::add-mask::$DOWNLOAD_LINK"
-            echo "Download link: $DOWNLOAD_LINK"
+            UPLOAD_OK=no
+            if mega_retry sudo megaput "$TARGET_PATH" --path /Root; then
+              UPLOAD_OK=yes
+            fi
+
+            DOWNLOAD_LINK=""
+            if [[ "$UPLOAD_OK" == "yes" ]]; then
+              echo "getting the download link"
+              for i in 1 2 3; do
+                DOWNLOAD_LINK=$(sudo megaexport /Root/"${TARGET_FILE}" 2>/dev/null | grep -Eo 'https://mega\.nz/[^ ]+' | tail -n1)
+                if [ -n "$DOWNLOAD_LINK" ]; then break; fi
+                sleep 20
+              done
+            fi
+
             if [ -n "$DOWNLOAD_LINK" ]; then
+              echo "::add-mask::$DOWNLOAD_LINK"
+              echo "Download link: $DOWNLOAD_LINK"
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
               echo "Pruning older disk archives from MEGA (free quota is 20 GB)..."
-              sudo megals /Root 2>/dev/null | grep -E '\.7z$' | grep -v "/${TARGET_FILE}$" | while read -r old; do
-                echo "  removing $old"
-                sudo megarm "$old" > /dev/null 2>&1 || true
-              done
+              OLD_ARCHIVES=$(sudo megals /Root 2>/dev/null | grep -E '\.7z$' | grep -v "/${TARGET_FILE}$" || true)
+              if [ -n "$OLD_ARCHIVES" ]; then
+                echo "$OLD_ARCHIVES" | sed 's/^/  removing /'
+                echo "$OLD_ARCHIVES" | xargs -r sudo megarm > /dev/null 2>&1 || true
+              fi
             else
-              echo "::warning::No MEGA download link produced - persistence will restart from scratch."
+              echo "::warning title=MEGA upload failed::Could not upload/save the disk this run (e.g. MEGA EBLOCKED)."
+              if [[ "${{ github.event.inputs.boot_mode }}" == "qcow2" ]]; then
+                PREV="${{ github.event.inputs.source_url }}"
+                if [[ "$PREV" == *"mega.nz"* ]]; then
+                  echo "::warning::Reusing the previous disk link so the next run keeps its state."
+                  echo "DOWNLOAD_LINK=$PREV" >> $GITHUB_ENV
+                  echo "$PREV" > disk_link.txt
+                fi
+              fi
             fi
           else
             echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, mega_account=${MEGA_EMAIL:-missing})."
