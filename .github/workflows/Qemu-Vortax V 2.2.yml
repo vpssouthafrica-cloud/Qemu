@@ -772,7 +772,7 @@ jobs:
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
               echo "Pruning older disk archives from MEGA (free quota is 20 GB)..."
-              OLD_ARCHIVES=$(sudo megals /Root 2>/dev/null | grep -E '\.7z$' | grep -v "/${TARGET_FILE}$" || true)
+              OLD_ARCHIVES=$(sudo megals /Root 2>/dev/null | grep -E "/${VM}-[0-9]{8}-[0-9]{4}\.7z$" | grep -v "/${TARGET_FILE}$" || true)
               if [ -n "$OLD_ARCHIVES" ]; then
                 echo "$OLD_ARCHIVES" | sed 's/^/  removing /'
                 echo "$OLD_ARCHIVES" | xargs -r sudo megarm > /dev/null 2>&1 || true
