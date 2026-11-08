@@ -124,6 +124,9 @@ jobs:
           fi
 
       - name: Install XFCE + RDP + NoMachine
+        env:
+          MEGA_EMAIL_SECRET: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD_SECRET: ${{ secrets.MEGA_PASSWORD }}
         run: |
 
           PROGRAM="${{ github.event.inputs.connection_program }}"
@@ -135,13 +138,20 @@ jobs:
           if [[ "$UPLOAD_QCOW2" == "yes" ]]; then
             echo "Installing MegaTools + pip..."
             sudo apt install -y megatools python3-pip > /dev/null 2>&1
-            echo "Installing Python libs..."
-            pip install rich requests > /dev/null 2>&1
-            echo "Downloading Mega CLI..."
-            curl -L "https://gitlab.com/MR.English2008/Mega_Gen/-/raw/main/maga_gen_cli.py" -o mega_gen_cli.py > /dev/null 2>&1
-            chmod +x mega_gen_cli.py > /dev/null 2>&1
-            echo "Running Mega CLI..."
-            python3 mega_gen_cli.py > /dev/null 2>&1
+            if [ -n "$MEGA_EMAIL_SECRET" ] && [ -n "$MEGA_PASSWORD_SECRET" ]; then
+              echo "Using fixed MEGA account from repository secrets."
+              echo "MEGA_EMAIL=$MEGA_EMAIL_SECRET" >> "$GITHUB_ENV"
+              echo "MEGA_PASSWORD=$MEGA_PASSWORD_SECRET" >> "$GITHUB_ENV"
+            else
+              echo "No MEGA secrets set - trying the throwaway account generator..."
+              pip install --break-system-packages -q rich requests > /dev/null 2>&1
+              curl -L "https://gitlab.com/MR.English2008/Mega_Gen/-/raw/main/maga_gen_cli.py" -o mega_gen_cli.py > /dev/null 2>&1
+              chmod +x mega_gen_cli.py > /dev/null 2>&1
+              python3 mega_gen_cli.py 2>&1 | tail -6 || true
+              if [ -z "$MEGA_EMAIL" ] && [ -z "$(grep -s '^MEGA_EMAIL=' "$GITHUB_ENV")" ]; then
+                echo "::warning title=MEGA account::No MEGA account available (set MEGA_EMAIL and MEGA_PASSWORD repository secrets). Persistence will be skipped this run."
+              fi
+            fi
           fi
           
           echo "Downloading virtio-win.iso "
@@ -716,7 +726,7 @@ jobs:
  
             echo "::add-mask::$MEGA_EMAIL"
             echo "::add-mask::$MEGA_PASSWORD"
-            DATE=$(date +%d-%m-%Y)
+            DATE=$(date +%Y%m%d-%H%M)
             echo "Compressing QCOW2 file to 7z..."
             sudo 7z a -t7z -mx=5 "/mnt/${VM}-${DATE}.7z" "/mnt/${VM}.qcow2"
       
@@ -743,6 +753,11 @@ jobs:
             if [ -n "$DOWNLOAD_LINK" ]; then
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
+              echo "Pruning older disk archives from MEGA (free quota is 20 GB)..."
+              sudo megals /Root 2>/dev/null | grep -E '\.7z$' | grep -v "/${TARGET_FILE}$" | while read -r old; do
+                echo "  removing $old"
+                sudo megarm "$old" > /dev/null 2>&1 || true
+              done
             else
               echo "::warning::No MEGA download link produced - persistence will restart from scratch."
             fi
