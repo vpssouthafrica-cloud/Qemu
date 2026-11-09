@@ -1,0 +1,488 @@
+name: Mint RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: 'VM name (release tag state-<vm_name>)'
+        required: true
+        default: 'mint'
+      action:
+        description: 'auto = restore if checkpoint exists else provision; provision = reinstall from ISO; boot = restore only'
+        type: choice
+        options: [auto, provision, boot]
+        default: 'auto'
+      source_url:
+        description: 'Optional source (release:state-mint). Empty = state-<vm_name>'
+        required: false
+        default: ''
+      runtime:
+        description: 'Keep-alive minutes (<=270)'
+        required: true
+        default: '270'
+      vnc_password:
+        description: 'VNC password'
+        required: true
+        default: 'runner'
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+  MINT_ISO_URL: 'https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso'
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      USERNAME: runner
+      PASSWORD: runner
+      GUEST_USER: mint
+      GUEST_PASS: runner
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/microsoft \
+            /usr/local/aws-cli /usr/local/aws-sam-cli /opt/az /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/Java_* /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/go /opt/hostedtoolcache/Ruby /opt/hostedtoolcache/php || true
+          sudo docker system prune -af --volumes > /dev/null 2>&1 || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 qemu-utils xorriso isolinux p7zip-full curl wget jq genisoimage netcat-openbsd
+          qemu-system-x86_64 --version | head -1
+
+      - name: Setup Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh > /dev/null 2>&1
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" \
+            --hostname "vortax-${{ github.event.inputs.vm_name }}" \
+            --accept-routes --accept-dns=false --timeout 90s
+          IP=$(sudo tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $IP"
+
+      - name: Resolve mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VM="${{ github.event.inputs.vm_name }}"
+          TAG="state-${VM}"
+          ACTION="${{ github.event.inputs.action }}"
+          SRC="${{ github.event.inputs.source_url }}"
+          [ -z "$SRC" ] && SRC="release:${TAG}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "SRC=$SRC" >> $GITHUB_ENV
+          HAVE=no
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 && \
+             gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+               | grep -qE "^${VM}-[0-9]{8}-[0-9]{4}\.7z\.001$"; then
+            HAVE=yes
+          fi
+          if [ "$ACTION" = "boot" ] && [ "$HAVE" != "yes" ]; then
+            echo "::error title=No checkpoint::action=boot but release $TAG has no disk checkpoint."
+            exit 1
+          fi
+          if [ "$ACTION" = "provision" ]; then NEED=yes
+          elif [ "$HAVE" = "yes" ]; then NEED=no
+          else NEED=yes; fi
+          echo "NEED_PROVISION=$NEED" >> $GITHUB_ENV
+          echo "Checkpoint present: $HAVE ; provision: $NEED"
+
+      - name: Restore checkpoint
+        if: ${{ env.NEED_PROVISION != 'yes' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          VM="${{ github.event.inputs.vm_name }}"
+          TAG="state-${VM}"
+          sudo mkdir -p /mnt/dl
+          sudo chown "$(id -u):$(id -g)" /mnt/dl
+          cd /mnt/dl
+          echo "Restoring $TAG ..."
+          gh release download "$TAG" --repo "${{ github.repository }}" --clobber
+          FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+          if [ -n "$FIRST" ]; then sudo 7z x -y "$FIRST" -o/mnt >/dev/null; fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::error::Could not restore ${VM}.qcow2 from $TAG"
+            exit 1
+          fi
+          sudo qemu-img resize "/mnt/${VM}.qcow2" 60G >/dev/null 2>&1 || true
+          echo "Restored /mnt/${VM}.qcow2"
+
+      - name: Provision Mint from ISO (unattended)
+        if: ${{ env.NEED_PROVISION == 'yes' }}
+        run: |
+          set -euo pipefail
+          VM="${{ github.event.inputs.vm_name }}"
+          WORK=/mnt/mint-build
+          sudo mkdir -p "$WORK"
+          sudo chown "$(id -u):$(id -g)" "$WORK"
+          cd "$WORK"
+
+          echo "Downloading Linux Mint ISO..."
+          wget -q -O mint.iso "$MINT_ISO_URL"
+          ls -lh mint.iso
+
+          echo "Extracting ISO..."
+          rm -rf iso
+          mkdir -p iso
+          xorriso -osirrox on -indev mint.iso -extract / iso >/dev/null 2>&1
+          sudo chmod -R u+w iso || true
+
+          echo "Patching boot config for automatic-ubiquity..."
+          python3 - <<'PY'
+          import glob, os, re
+          patched = 0
+          for p in glob.glob('iso/isolinux/*.cfg'):
+              text = open(p, errors='replace').read()
+              lines = text.splitlines()
+              out, done = [], False
+              for ln in lines:
+                  if (not done) and ('boot=casper' in ln) and ('initrd=' in ln):
+                      m = re.search(r'initrd=\S+', ln)
+                      initrd = m.group(0) if m else 'initrd=/casper/initrd.lz'
+                      out.append('  append  file=/cdrom/preseed/vortax.seed boot=casper '
+                                 'automatic-ubiquity auto=true priority=critical %s '
+                                 'quiet splash noprompt noshell ---' % initrd)
+                      done = True
+                  else:
+                      out.append(ln)
+              if done:
+                  if any(l.strip().startswith('timeout') for l in out):
+                      out = ['timeout 30' if l.strip().startswith('timeout') else l for l in out]
+                  else:
+                      out.insert(0, 'timeout 30')
+                  open(p, 'w').write('\n'.join(out) + '\n')
+                  print('patched', p)
+                  patched += 1
+          if patched == 0:
+              raise SystemExit('ERROR: no isolinux boot entry found to patch')
+          PY
+
+          mkdir -p iso/preseed
+          cat > iso/preseed/vortax.seed <<'SEED'
+          ### Locale / keyboard
+          d-i debian-installer/locale string en_US.UTF-8
+          d-i console-setup/ask_detect boolean false
+          d-i console-setup/layoutcode string us
+          d-i keyboard-configuration/xkb-keymap string us
+          d-i localechooser/supported-locales string en_US.UTF-8
+
+          ### Time
+          d-i clock-setup/utc boolean true
+          d-i time/zone string Etc/UTC
+          d-i clock-setup/ntp boolean true
+
+          ### Network
+          d-i netcfg/get_hostname string mint
+          d-i netcfg/get_domain string local
+          d-i netcfg/choose_interface select auto
+
+          ### Mirrors
+          d-i apt-setup/multiverse boolean true
+          d-i apt-setup/restricted boolean true
+          d-i apt-setup/universe boolean true
+          d-i mirror/country string manual
+
+          ### Disk: whole virtio disk, MBR, single ext4 root
+          d-i partman-auto/disk string /dev/vda
+          d-i partman-auto/method string regular
+          d-i partman-auto/choose_recipe select atomic
+          d-i partman-auto/purge_lvm_from_device boolean true
+          d-i partman-lvm/device_remove_lvm boolean true
+          d-i partman-lvm/confirm boolean true
+          d-i partman-lvm/confirm_nooverwrite boolean true
+          d-i partman-md/device_remove_md boolean true
+          d-i partman-basicfilesystems/choose_label string msdos
+          d-i partman-basicfilesystems/default_label string msdos
+          d-i partman-partitioning/choose_label string msdos
+          d-i partman-partitioning/default_label string msdos
+          d-i partman/choose_label string msdos
+          d-i partman/default_label string msdos
+          d-i partman-partitioning/confirm_write_new_label boolean true
+          d-i partman/choose_partition select finish
+          d-i partman/confirm boolean true
+          d-i partman/confirm_nooverwrite boolean true
+          d-i partman/mount_style select uuid
+
+          ubiquity partman-auto/disk string /dev/vda
+          ubiquity partman-auto/method string regular
+          ubiquity partman-auto/choose_recipe select atomic
+          ubiquity partman-auto/purge_lvm_from_device boolean true
+          ubiquity partman-lvm/device_remove_lvm boolean true
+          ubiquity partman-lvm/confirm boolean true
+          ubiquity partman-lvm/confirm_nooverwrite boolean true
+          ubiquity partman-md/device_remove_md boolean true
+          ubiquity partman-basicfilesystems/choose_label string msdos
+          ubiquity partman-basicfilesystems/default_label string msdos
+          ubiquity partman-partitioning/choose_label string msdos
+          ubiquity partman-partitioning/default_label string msdos
+          ubiquity partman/choose_label string msdos
+          ubiquity partman/default_label string msdos
+          ubiquity partman-partitioning/confirm_write_new_label boolean true
+          ubiquity partman/choose_partition select finish
+          ubiquity partman/confirm boolean true
+          ubiquity partman/confirm_nooverwrite boolean true
+          ubiquity partman/mount_style select uuid
+
+          ### Bootloader
+          d-i grub-installer/only_debian boolean true
+          d-i grub-installer/bootdev string /dev/vda
+          d-i grub-pc/install_devices string /dev/vda
+
+          ### Account
+          d-i passwd/user-fullname string Mint
+          d-i passwd/username string mint
+          d-i passwd/user-password-crypted password $6$aXJ35Ufb85Zo2uTt$g4rHhsjYBcx7YP3V3cecwr3OohtYdkfXqbkhFxbBNCjTeLFPQKFIbjiDwSIheRyZswVe35xb0PrPtnt/qw9Al.
+          d-i passwd/user-default-groups string adm audio cdrom dip lpadmin sudo plugdev sambashare video
+          d-i passwd/root-login boolean false
+          d-i user-setup/allow-password-weak boolean true
+          d-i user-setup/encrypt-home boolean false
+          ubiquity passwd/username string mint
+          ubiquity passwd/user-password-crypted password $6$aXJ35Ufb85Zo2uTt$g4rHhsjYBcx7YP3V3cecwr3OohtYdkfXqbkhFxbBNCjTeLFPQKFIbjiDwSIheRyZswVe35xb0PrPtnt/qw9Al.
+
+          ### Finish
+          ubiquity ubiquity/use_nonfree boolean false
+          d-i ubiquity/reboot boolean true
+          ubiquity ubiquity/reboot boolean true
+
+          ### Post-install: SSH + RDP straight into Cinnamon
+          ubiquity ubiquity/success_command string \
+            in-target env DEBIAN_FRONTEND=noninteractive apt-get -y update; \
+            in-target env DEBIAN_FRONTEND=noninteractive apt-get -y install openssh-server xrdp dbus-x11; \
+            in-target bash -c 'printf "#!/bin/sh\nif test -r /etc/profile; then . /etc/profile; fi\nexec dbus-run-session -- cinnamon-session\n" > /etc/xrdp/startwm.sh'; \
+            in-target chmod +x /etc/xrdp/startwm.sh; \
+            in-target bash -c 'echo "cinnamon-session --session=cinnamon" > /home/mint/.xsession; chown mint:mint /home/mint/.xsession'; \
+            in-target systemctl enable ssh xrdp || true; \
+            in-target systemctl set-default graphical.target || true; \
+            touch /target/etc/vortax-provisioned
+          SEED
+
+          echo "Rebuilding bootable ISO..."
+          EFI_ARGS=()
+          if [ -f iso/boot/grub/efi.img ]; then
+            EFI_ARGS=(-eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat)
+          fi
+          xorriso -as mkisofs -r -J -joliet-long -V "Linux Mint 22.3 Cinnamon 64-bit" \
+            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+            -c isolinux/boot.cat -b isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            "${EFI_ARGS[@]}" -o mint-auto.iso iso >/dev/null
+          ls -lh mint-auto.iso
+
+          echo "Creating 60G disk..."
+          sudo rm -f "/mnt/${VM}.qcow2"
+          sudo qemu-img create -f qcow2 "/mnt/${VM}.qcow2" 60G
+
+          echo "Running unattended installer (10-25 min)..."
+          ( qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 8G \
+              -cdrom mint-auto.iso -boot d -no-reboot \
+              -drive if=virtio,file="/mnt/${VM}.qcow2",format=qcow2 \
+              -vnc :0,password=on -monitor tcp:localhost:4444,server,nowait \
+              -display none -serial file:/tmp/mint-install-serial.log \
+              -netdev user,id=n0 -device e1000,netdev=n0 \
+              > /tmp/mint-install-qemu.log 2>&1 ) &
+          QPID=$!
+          sleep 10
+          echo "change vnc password ${{ github.event.inputs.vnc_password }}" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+          SECS=0
+          while kill -0 "$QPID" 2>/dev/null; do
+            sleep 20
+            SECS=$((SECS+20))
+            if [ "$SECS" -ge 4500 ]; then
+              echo "::error::Installer exceeded 75 minutes"
+              sudo pkill -9 -f qemu-system-x86_64 || true
+              break
+            fi
+            if [ $((SECS % 120)) -eq 0 ]; then
+              echo "installer running ${SECS}s, disk $(du -h "/mnt/${VM}.qcow2" 2>/dev/null | cut -f1)"
+            fi
+          done
+          echo "=== installer serial tail ==="
+          sudo tail -30 /tmp/mint-install-serial.log 2>/dev/null || true
+          echo "=== installer qemu log tail ==="
+          tail -20 /tmp/mint-install-qemu.log 2>/dev/null || true
+          sudo chown "$(id -u):$(id -g)" "/mnt/${VM}.qcow2"
+          SZ=$(stat -c%s "/mnt/${VM}.qcow2")
+          echo "Installed disk bytes: $SZ"
+          if [ "$SZ" -lt 3000000000 ]; then
+            echo "::error::Disk is only $SZ bytes, the unattended install probably failed"
+            exit 1
+          fi
+          rm -rf iso mint.iso mint-auto.iso || true
+          echo "Provisioning complete."
+
+      - name: Boot Mint
+        run: |
+          set -e
+          VM="${{ github.event.inputs.vm_name }}"
+          test -f "/mnt/${VM}.qcow2"
+          echo "Starting QEMU..."
+          sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 8G \
+            -drive if=virtio,file="/mnt/${VM}.qcow2",format=qcow2 \
+            -boot c \
+            -vnc :0,password=on -monitor tcp:localhost:4444,server,nowait \
+            -display none -serial file:/tmp/mint-serial.log \
+            -netdev user,id=n0,hostfwd=tcp::3389-:3389,hostfwd=tcp::10022-:22 \
+            -device e1000,netdev=n0 > /tmp/mint-qemu.log 2>&1 &
+          echo $! | sudo tee /tmp/mint-qemu.pid >/dev/null
+          for i in $(seq 1 30); do
+            if echo "change vnc password ${{ github.event.inputs.vnc_password }}" | nc -q 1 localhost 4444 >/dev/null 2>&1; then
+              echo "VNC password set"; break
+            fi
+            sleep 2
+          done
+          ok=no
+          for i in $(seq 1 60); do
+            if nc -z localhost 3389 >/dev/null 2>&1; then ok=yes; break; fi
+            sleep 10
+          done
+          echo "xrdp reachable on host port 3389: $ok"
+          echo "=== guest serial tail ==="
+          sudo tail -20 /tmp/mint-serial.log 2>/dev/null || true
+          if ! pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
+            echo "::error::QEMU is not running after boot; see /tmp/mint-qemu.log"
+            tail -40 /tmp/mint-qemu.log 2>/dev/null || true
+            exit 1
+          fi
+          if [ "$ok" != "yes" ]; then
+            echo "::warning title=RDP not up::xrdp did not open port 3389 within 10 minutes"
+          fi
+          touch /mnt/mint-ready
+
+      - name: Connection info
+        run: |
+          TSIP="${TAILSCALE_IP}"
+          SELF=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+          [ -z "$SELF" ] && SELF="vortax-${{ github.event.inputs.vm_name }}"
+          [ -z "$TSIP" ] && TSIP=$(sudo tailscale ip -4 2>/dev/null | head -n1)
+          {
+            echo "Program: RDP (inside the Mint guest)"
+            echo "Tailscale node: $SELF"
+            echo "Tailscale IP: $TSIP"
+            echo "RDP: $TSIP:3389 (or $SELF:3389)"
+            echo "RDP username: mint"
+            echo "RDP password: runner"
+            echo "SSH: ssh mint@$SELF -p 10022 (password runner)"
+            echo "VNC: $TSIP:5900 (password ${{ github.event.inputs.vnc_password }})"
+          } > connection.txt
+          {
+            echo "### Mint RDP"
+            echo "- **Tailscale node:** \`$SELF\`"
+            echo "- **RDP:** \`$TSIP:3389\` — user \`mint\`, password \`runner\`"
+            echo "- **SSH:** \`ssh mint@$SELF -p 10022\` — password \`runner\`"
+            echo "- **VNC:** \`$TSIP:5900\` — password \`${{ github.event.inputs.vnc_password }}\`"
+          } >> $GITHUB_STEP_SUMMARY
+          cat connection.txt
+
+      - name: Upload connection info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection
+          path: connection.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Keep alive
+        run: |
+          RUNTIME="${{ github.event.inputs.runtime }}"
+          if [ "$RUNTIME" -gt 270 ]; then RUNTIME=270; fi
+          echo "Mint is up for ${RUNTIME} minutes."
+          sleep $((RUNTIME * 60))
+          echo "Keep-alive finished."
+
+      - name: Checkpoint and upload state
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VM="${{ github.event.inputs.vm_name }}"
+          TAG="state-${VM}"
+          UPLOAD="${{ github.event.inputs.action }}"
+          echo "Requesting ACPI shutdown of the guest..."
+          echo "system_powerdown" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+          for i in $(seq 1 60); do
+            pgrep -f qemu-system-x86_64 >/dev/null 2>&1 || break
+            sleep 1
+          done
+          sudo pkill -9 -f qemu-system-x86_64 || true
+          sleep 2
+          if [ ! -f /mnt/mint-ready ]; then
+            echo "::warning title=Not checkpointing::The VM never booted, so this disk is not uploaded."
+            exit 0
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::warning::No disk to upload"; exit 0
+          fi
+          echo "Compacting the disk image..."
+          sudo qemu-img convert -O qcow2 "/mnt/${VM}.qcow2" "/mnt/${VM}-compact.qcow2" || true
+          if [ -f "/mnt/${VM}-compact.qcow2" ]; then
+            sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"
+          fi
+          DATE=$(date -u +%Y%m%d-%H%M)
+          BASE="${VM}-${DATE}.7z"
+          echo "Compressing in 1800 MB volumes..."
+          sudo 7z a -t7z -mx=3 -v1800m "/mnt/${BASE}" "/mnt/${VM}.qcow2" >/dev/null
+          sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}".7z.* 2>/dev/null || true
+          ls -lh /mnt/"${VM}-${DATE}".7z.* | awk '{print $9, $5}'
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "Vortax state: ${VM}" \
+              --notes "Rolling disk checkpoints for ${VM}. The newest timestamp is the current state."
+          if gh release upload "$TAG" /mnt/"${VM}-${DATE}".7z.* --repo "${{ github.repository }}" --clobber; then
+            echo "State saved under $TAG ($DATE)."
+            echo "DOWNLOAD_LINK=release:${TAG}" >> $GITHUB_ENV
+            echo "release:${TAG}" > disk_link.txt
+            gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+              | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.7z" \
+              | grep -v "^${VM}-${DATE}\.7z" \
+              | while read -r a; do gh release delete-asset "$TAG" "$a" --repo "${{ github.repository }}" -y >/dev/null 2>&1 || true; done
+          else
+            echo "::warning title=State upload failed::Could not publish the checkpoint."
+          fi
+          sudo rm -f /mnt/"${VM}-${DATE}".7z.* || true
+
+      - name: Tailscale cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo tailscale logout || true
+
+      - name: Trigger next machine (loop)
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ ! -f /mnt/mint-ready ]; then
+            echo "::warning title=Auto-loop stopped::The VM did not boot, so no successor was dispatched."
+            exit 0
+          fi
+          LINK="${DOWNLOAD_LINK:-release:state-${{ github.event.inputs.vm_name }}}"
+          echo "Auto-loop: dispatching Mint RDP (source=$LINK)"
+          gh workflow run "Mint RDP" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            -f "vm_name=${{ github.event.inputs.vm_name }}" \
+            -f "action=boot" \
+            -f "source_url=$LINK" \
+            -f "runtime=${{ github.event.inputs.runtime }}" \
+            -f "vnc_password=${{ github.event.inputs.vnc_password }}" 2>&1 | tee dispatch.log
+          if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "::notice title=Auto-loop::Next Mint run queued."
+          else
+            echo "::warning title=Auto-loop failed::Could not dispatch the next run."
+          fi
