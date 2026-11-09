@@ -31,7 +31,7 @@ permissions:
 
 env:
   TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-  MINT_ISO_URL: 'https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso'
+  MINT_ISO_URL: 'https://mirrors.edge.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso'
 
 jobs:
   mint:
@@ -123,6 +123,7 @@ jobs:
 
       - name: Provision Mint from ISO (unattended)
         if: ${{ env.NEED_PROVISION == 'yes' }}
+        timeout-minutes: 100
         run: |
           set -euo pipefail
           VM="${{ github.event.inputs.vm_name }}"
@@ -132,13 +133,17 @@ jobs:
           cd "$WORK"
 
           echo "Downloading Linux Mint ISO..."
-          wget -q -O mint.iso "$MINT_ISO_URL"
+          rm -f mint.iso
+          timeout 1800 curl -L --retry 3 --connect-timeout 20 -o mint.iso "$MINT_ISO_URL"
           ls -lh mint.iso
+          SZ_ISO=$(stat -c%s mint.iso)
+          echo "ISO bytes: $SZ_ISO"
+          if [ "$SZ_ISO" -lt 3000000000 ]; then echo "::error::ISO download looks truncated"; exit 1; fi
 
           echo "Extracting ISO..."
           rm -rf iso
           mkdir -p iso
-          xorriso -osirrox on -indev mint.iso -extract / iso >/dev/null 2>&1
+          timeout 900 xorriso -osirrox on -indev mint.iso -extract / iso >/dev/null 2>&1
           sudo chmod -R u+w iso || true
 
           echo "Patching boot config for automatic-ubiquity..."
@@ -275,7 +280,7 @@ jobs:
           if [ -f iso/boot/grub/efi.img ]; then
             EFI_ARGS=(-eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat)
           fi
-          xorriso -as mkisofs -r -J -joliet-long -V "Linux Mint 22.3 Cinnamon 64-bit" \
+          timeout 900 xorriso -as mkisofs -r -J -joliet-long -V "Linux Mint 22.3 Cinnamon 64-bit" \
             -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
             -c isolinux/boot.cat -b isolinux/isolinux.bin \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
@@ -284,7 +289,7 @@ jobs:
 
           echo "Creating 60G disk..."
           sudo rm -f "/mnt/${VM}.qcow2"
-          sudo qemu-img create -f qcow2 "/mnt/${VM}.qcow2" 60G
+          qemu-img create -f qcow2 "/mnt/${VM}.qcow2" 60G
 
           echo "Running unattended installer (10-25 min)..."
           ( qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 8G \
