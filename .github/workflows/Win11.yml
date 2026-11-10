@@ -158,16 +158,10 @@ jobs:
           fi
           mkdir -p /tmp/unattend
           cp .github/win11/Autounattend.xml /tmp/unattend/Autounattend.xml
-          echo "Remastering install ISO with Autounattend.xml at the root..."
-          xorriso -indev /mnt/dl/win11.iso -outdev /mnt/dl/win11-auto.iso \
-            -map /tmp/unattend/Autounattend.xml /Autounattend.xml \
-            -boot_image any replay 2>/dev/null
-          xorriso -indev /mnt/dl/win11-auto.iso -report_el_torito plain 2>/dev/null | grep -i "El Torito" | head -2 || true
-          sudo mv /mnt/dl/win11-auto.iso /mnt/win11.iso
+          sudo mv /mnt/dl/win11.iso /mnt/win11.iso
           sudo chmod 644 /mnt/win11.iso
-          sudo rm -f /mnt/dl/win11.iso
 
-          echo "Building backup answer ISO..."
+          echo "Building unattended answer ISO..."
           genisoimage -quiet -o /tmp/unattend.iso -J -R -V UNATTEND /tmp/unattend
           sudo mv /tmp/unattend.iso /mnt/unattend.iso
           sudo chmod 644 /mnt/unattend.iso
