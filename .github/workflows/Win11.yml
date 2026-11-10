@@ -193,7 +193,7 @@ jobs:
               -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
               -o ExitOnForwardFailure=yes -i /tmp/vps_tunnel \
               -R 0.0.0.0:${RDP_PORT}:localhost:${RDP_PORT} \
-              -R 0.0.0.0:${VNC_PORT}:localhost:${VNC_PORT} \
+              -R 0.0.0.0:${VNC_PORT}:localhost:5900 \
               opc@${VPS_TUNNEL_HOST}
             sleep 5
           done
