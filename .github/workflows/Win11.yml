@@ -74,7 +74,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            qemu-system-x86 qemu-utils ovmf swtpm genisoimage p7zip-full \
+            qemu-system-x86 qemu-utils ovmf swtpm genisoimage xorriso p7zip-full \
             curl wget jq netcat-openbsd aria2 tar >/dev/null
           qemu-system-x86_64 --version | head -n1
           swtpm --version | head -n1
@@ -156,11 +156,18 @@ jobs:
             echo "::error::ISO size mismatch - download incomplete or changed."
             exit 1
           fi
-          sudo mv /mnt/dl/win11.iso /mnt/win11.iso
-
-          echo "Building unattended answer ISO..."
           mkdir -p /tmp/unattend
           cp .github/win11/Autounattend.xml /tmp/unattend/Autounattend.xml
+          echo "Remastering install ISO with Autounattend.xml at the root..."
+          xorriso -indev /mnt/dl/win11.iso -outdev /mnt/dl/win11-auto.iso \
+            -map /tmp/unattend/Autounattend.xml /Autounattend.xml \
+            -boot_image any replay 2>/dev/null
+          xorriso -indev /mnt/dl/win11-auto.iso -report_el_torito plain 2>/dev/null | grep -i "El Torito" | head -2 || true
+          sudo mv /mnt/dl/win11-auto.iso /mnt/win11.iso
+          sudo chmod 644 /mnt/win11.iso
+          sudo rm -f /mnt/dl/win11.iso
+
+          echo "Building backup answer ISO..."
           genisoimage -quiet -o /tmp/unattend.iso -J -R -V UNATTEND /tmp/unattend
           sudo mv /tmp/unattend.iso /mnt/unattend.iso
           sudo chmod 644 /mnt/unattend.iso
@@ -279,6 +286,13 @@ jobs:
             fi
             sleep 2
           done
+          if [ "$NEED" = "yes" ]; then
+            echo "Sending boot keypresses (Press any key to boot from CD)..."
+            for i in $(seq 1 12); do
+              echo "sendkey spc" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+              sleep 1
+            done
+          fi
 
           rdp_up() {
           python3 - <<'PY'
