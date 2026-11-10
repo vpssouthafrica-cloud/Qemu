@@ -161,7 +161,9 @@ jobs:
           echo "Building unattended answer ISO..."
           mkdir -p /tmp/unattend
           cp .github/win11/Autounattend.xml /tmp/unattend/Autounattend.xml
-          genisoimage -quiet -o /mnt/unattend.iso -J -R -V UNATTEND /tmp/unattend
+          genisoimage -quiet -o /tmp/unattend.iso -J -R -V UNATTEND /tmp/unattend
+          sudo mv /tmp/unattend.iso /mnt/unattend.iso
+          sudo chmod 644 /mnt/unattend.iso
 
           echo "Creating ${DISK_GB}G qcow2 disk..."
           sudo rm -f "/mnt/${VM}.qcow2"
