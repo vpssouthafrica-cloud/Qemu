@@ -1,0 +1,402 @@
+name: Bliss OS
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: "VM name"
+        required: true
+        default: "bliss"
+        type: string
+      action:
+        description: "auto | provision | boot"
+        required: true
+        default: "auto"
+        type: choice
+        options: [auto, provision, boot]
+      source_url:
+        description: "Checkpoint source (release:state-bliss) - optional"
+        required: false
+        default: ""
+        type: string
+      runtime:
+        description: "Minutes to keep the VM alive (max 270)"
+        required: true
+        default: "270"
+        type: string
+      vnc_password:
+        description: "VNC password"
+        required: true
+        default: "runner"
+        type: string
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: bliss-${{ github.event.inputs.vm_name || 'bliss' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  VM: ${{ github.event.inputs.vm_name || 'bliss' }}
+  ACTION: ${{ github.event.inputs.action || 'auto' }}
+  SOURCE_URL: ${{ github.event.inputs.source_url || '' }}
+  RUNTIME: ${{ github.event.inputs.runtime || '270' }}
+  VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'runner' }}
+  TAG: state-${{ github.event.inputs.vm_name || 'bliss' }}
+  BLISS_ISO_URL: "https://downloads.sourceforge.net/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso"
+
+jobs:
+  bliss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm \
+            /usr/local/lib/node_modules /opt/az 2>/dev/null || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          sudo apt-get clean || true
+          df -h / | tail -1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 qemu-utils p7zip-full curl wget jq e2fsprogs \
+            grub-pc-bin grub2-common xorriso netcat-openbsd util-linux >/dev/null
+          qemu-system-x86_64 --version | head -n1
+
+      - name: Setup Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -e
+          curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" \
+            --hostname "vortax-${{ env.VM }}" \
+            --accept-routes --accept-dns=false --timeout 90s
+          TS_IP=$(sudo tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Resolve mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          HAVE=no
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+                 | grep -qE "^${VM}-[0-9]{8}-[0-9]{4}\.7z\.001"; then
+              HAVE=yes
+            fi
+          fi
+          if [ "$ACTION" = "boot" ] && [ "$HAVE" != "yes" ]; then
+            echo "::error title=No checkpoint::action=boot but release $TAG has no disk checkpoint."
+            exit 1
+          fi
+          if [ "$ACTION" = "provision" ]; then NEED=yes
+          elif [ "$HAVE" = "yes" ]; then NEED=no
+          else NEED=yes; fi
+          echo "NEED_PROVISION=$NEED" >> $GITHUB_ENV
+          echo "Checkpoint present: $HAVE ; provision: $NEED"
+
+      - name: Restore checkpoint
+        if: ${{ env.NEED_PROVISION != 'yes' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          sudo mkdir -p /mnt/dl
+          sudo chown "$(id -u):$(id -g)" /mnt/dl
+          cd /mnt/dl
+          echo "Restoring $TAG ..."
+          gh release download "$TAG" --repo "${{ github.repository }}" --clobber
+          FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+          if [ -n "$FIRST" ]; then sudo 7z x -y "$FIRST" -o/mnt >/dev/null; fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            QC=$(sudo find /mnt -maxdepth 4 -name "${VM}.qcow2" 2>/dev/null | head -n1)
+            if [ -n "$QC" ]; then sudo mv "$QC" "/mnt/${VM}.qcow2"; fi
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::error::Could not restore ${VM}.qcow2 from $TAG"
+            exit 1
+          fi
+          sudo qemu-img resize "/mnt/${VM}.qcow2" 40G >/dev/null 2>&1 || true
+          echo "Restored /mnt/${VM}.qcow2"
+
+      - name: Provision Bliss OS (manual install to disk)
+        if: ${{ env.NEED_PROVISION == 'yes' }}
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          WORK=/mnt/bliss-build
+          sudo mkdir -p "$WORK"
+          sudo chown "$(id -u):$(id -g)" "$WORK"
+          cd "$WORK"
+
+          echo "Downloading Bliss OS 16.9.7 ISO..."
+          rm -f bliss.iso
+          timeout 1800 curl -L --retry 3 --connect-timeout 20 -o bliss.iso "$BLISS_ISO_URL"
+          ls -lh bliss.iso
+          SZ=$(stat -c%s bliss.iso)
+          echo "ISO bytes: $SZ"
+          if [ "$SZ" -lt 2000000000 ]; then echo "::error::ISO download looks truncated"; exit 1; fi
+
+          echo "Extracting kernel / initrd / system image..."
+          rm -rf iso
+          mkdir -p iso
+          timeout 900 xorriso -osirrox on -indev bliss.iso -extract / iso >/dev/null 2>&1
+
+          echo "Building 40G disk image with one ext4 partition..."
+          rm -f disk.raw part.img
+          truncate -s 40G disk.raw
+          sudo sfdisk disk.raw >/dev/null <<'SFDISK'
+          label: dos
+          ,,83,*
+          SFDISK
+          LOOP=$(sudo losetup -fP --show disk.raw)
+          echo "loop device: $LOOP"
+          sudo partprobe "$LOOP" >/dev/null 2>&1 || true
+          sudo udevadm settle >/dev/null 2>&1 || true
+          sleep 1
+          PART="${LOOP}p1"
+          sudo mkfs.ext4 -q -F -L bliss "$PART"
+          sudo mkdir -p /mnt/blissroot
+          sudo mount "$PART" /mnt/blissroot
+          sudo mkdir -p /mnt/blissroot/blissos/data
+          sudo cp iso/kernel iso/initrd.img /mnt/blissroot/blissos/
+          for f in iso/system.sfs iso/system.img iso/ramdisk.img; do
+            [ -f "$f" ] && sudo cp "$f" /mnt/blissroot/blissos/ || true
+          done
+          sudo chmod 755 /mnt/blissroot/blissos/data
+          ls -lh /mnt/blissroot/blissos/
+
+          echo "Installing GRUB (BIOS)..."
+          sudo grub-install --target=i386-pc --boot-directory=/mnt/blissroot/boot \
+            --modules="part_msdos ext2" "$LOOP" >/dev/null
+          sudo mkdir -p /mnt/blissroot/boot/grub
+          sudo tee /mnt/blissroot/boot/grub/grub.cfg >/dev/null <<'GRUB'
+          set default=0
+          set timeout=3
+          menuentry 'Bliss OS 16.9.7 (Android 13)' {
+            search --file --no-floppy --set=root /blissos/kernel
+            linux /blissos/kernel root=/dev/ram0 SRC=/blissos androidboot.selinux=permissive console=ttyS0 loglevel=6
+            initrd /blissos/initrd.img
+          }
+          GRUB
+
+          sudo umount /mnt/blissroot
+          sudo losetup -d "$LOOP"
+
+          echo "Converting to qcow2..."
+          sudo rm -f "/mnt/${VM}.qcow2"
+          sudo qemu-img convert -f raw -O qcow2 disk.raw "/mnt/${VM}.qcow2"
+          sudo chown "$(id -u):$(id -g)" "/mnt/${VM}.qcow2"
+          ls -lh "/mnt/${VM}.qcow2"
+          SZQ=$(stat -c%s "/mnt/${VM}.qcow2")
+          echo "Disk bytes: $SZQ"
+          if [ "$SZQ" -lt 1000000000 ]; then
+            echo "::error::Disk image looks too small, install failed"
+            exit 1
+          fi
+
+          rm -rf iso bliss.iso disk.raw part.img
+          echo "Provisioning complete."
+
+      - name: Boot Bliss OS
+        run: |
+          set -e
+          test -f "/mnt/${VM}.qcow2"
+          echo "Starting QEMU..."
+          sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 6G \
+            -machine q35 \
+            -drive if=virtio,file="/mnt/${VM}.qcow2",format=qcow2 \
+            -boot c \
+            -vnc :0,password=on -monitor tcp:localhost:4444,server,nowait \
+            -display none -serial file:/tmp/bliss-serial.log \
+            -device virtio-vga \
+            -device virtio-tablet -device virtio-keyboard \
+            -netdev user,id=n0,hostfwd=tcp::5555-:5555 \
+            -device virtio-net-pci,netdev=n0 > /tmp/bliss-qemu.log 2>&1 &
+          echo $! | sudo tee /tmp/bliss-qemu.pid >/dev/null
+          for i in $(seq 1 30); do
+            if echo "change vnc password ${VNC_PASSWORD}" | nc -q 1 localhost 4444 >/dev/null 2>&1; then
+              echo "VNC password set"; break
+            fi
+            sleep 2
+          done
+
+          display_alive() {
+            sudo rm -f /tmp/boot.ppm
+            echo "screendump /tmp/boot.ppm" | nc -q 1 localhost 4444 >/dev/null 2>&1 || return 1
+            sleep 1
+            sudo chmod 644 /tmp/boot.ppm 2>/dev/null || true
+            [ -s /tmp/boot.ppm ] || return 1
+            python3 - <<'PY'
+          import sys
+          try:
+              with open('/tmp/boot.ppm', 'rb') as f:
+                  d = f.read()
+          except Exception:
+              sys.exit(1)
+          parts = d.split(b'\n', 3)
+          if len(parts) < 4 or not parts[0].startswith(b'P6'):
+              sys.exit(1)
+          data = parts[3]
+          if len(data) < 3000:
+              sys.exit(1)
+          px = data[:3]
+          diff = total = 0
+          step = max(3, (len(data) // 3 // 20000) * 3)
+          for j in range(0, len(data) - 2, step):
+              total += 1
+              if data[j:j+3] != px:
+                  diff += 1
+          sys.exit(0 if total and diff / total > 0.02 else 1)
+          PY
+          }
+
+          READY=no
+          for i in $(seq 1 32); do
+            if ! pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
+              echo "::error::QEMU exited during boot; see /tmp/bliss-qemu.log"
+              tail -40 /tmp/bliss-qemu.log 2>/dev/null || true
+              exit 1
+            fi
+            if display_alive; then READY=yes; break; fi
+            sleep 10
+          done
+          echo "QEMU running. Display active: $READY"
+          echo "=== serial tail ==="
+          sudo tail -30 /tmp/bliss-serial.log 2>/dev/null || true
+          if [ "$READY" = "yes" ]; then
+            sudo touch /mnt/bliss-ready
+          else
+            echo "::warning title=Guest not confirmed::No display activity detected; this run will not be checkpointed or looped. Connect to VNC to inspect."
+          fi
+
+      - name: Connection info
+        run: |
+          TSIP="${TAILSCALE_IP}"
+          SELF=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+          [ -z "$SELF" ] && SELF="vortax-${{ env.VM }}"
+          [ -z "$TSIP" ] && TSIP=$(sudo tailscale ip -4 2>/dev/null | head -n1)
+          {
+            echo "Program: Bliss OS 16.9.7 (Android 13)"
+            echo "Tailscale node: $SELF"
+            echo "Tailscale IP: $TSIP"
+            echo "VNC: $TSIP:5900 (or $SELF:5900) password ${{ env.VNC_PASSWORD }}"
+            echo "ADB: $TSIP:5555 (QEMU hostfwd to guest 5555)"
+          } > connection.txt
+          {
+            echo "### Bliss OS"
+            echo "- **Tailscale node:** \`$SELF\`"
+            echo "- **VNC:** \`$TSIP:5900\` — password \`${{ env.VNC_PASSWORD }}\`"
+            echo "- **ADB:** \`$TSIP:5555\`"
+          } >> $GITHUB_STEP_SUMMARY
+          cat connection.txt
+
+      - name: Upload connection info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection
+          path: connection.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Keep alive
+        run: |
+          RUNTIME="${{ env.RUNTIME }}"
+          if [ "$RUNTIME" -gt 270 ]; then RUNTIME=270; fi
+          echo "Bliss is up for ${RUNTIME} minutes."
+          sleep $((RUNTIME * 60))
+          echo "Keep-alive finished."
+
+      - name: Checkpoint and upload state
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Requesting ACPI shutdown of the guest..."
+          echo "system_powerdown" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+          for i in $(seq 1 60); do
+            pgrep -f qemu-system-x86_64 >/dev/null 2>&1 || break
+            sleep 1
+          done
+          sudo pkill -9 -f qemu-system-x86_64 || true
+          sleep 2
+          if [ ! -f /mnt/bliss-ready ]; then
+            echo "::warning title=Not checkpointing::The VM never booted, so this disk is not uploaded."
+            exit 0
+          fi
+          if [ ! -f "/mnt/${VM}.qcow2" ]; then
+            echo "::warning::No disk to upload"; exit 0
+          fi
+          echo "Compacting the disk image..."
+          sudo qemu-img convert -O qcow2 "/mnt/${VM}.qcow2" "/mnt/${VM}-compact.qcow2" || true
+          if [ -f "/mnt/${VM}-compact.qcow2" ]; then
+            sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"
+          fi
+          DATE=$(date -u +%Y%m%d-%H%M)
+          BASE="${VM}-${DATE}.7z"
+          echo "Compressing in 1800 MB volumes..."
+          ( cd /mnt && sudo 7z a -t7z -mx=3 -v1800m "/mnt/${BASE}" "${VM}.qcow2" >/dev/null )
+          sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}".7z.* 2>/dev/null || true
+          ls -lh /mnt/"${VM}-${DATE}".7z.* | awk '{print $9, $5}'
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "Vortax state: ${VM}" \
+              --notes "Rolling disk checkpoints for ${VM}. The newest timestamp is the current state."
+          if gh release upload "$TAG" /mnt/"${VM}-${DATE}".7z.* --repo "${{ github.repository }}" --clobber; then
+            echo "State saved under $TAG ($DATE)."
+            echo "DOWNLOAD_LINK=release:${TAG}" >> $GITHUB_ENV
+            echo "release:${TAG}" > disk_link.txt
+            gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+              | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.7z" \
+              | grep -v "^${VM}-${DATE}\.7z" \
+              | while read -r a; do gh release delete-asset "$TAG" "$a" --repo "${{ github.repository }}" -y >/dev/null 2>&1 || true; done
+          else
+            echo "::warning title=State upload failed::Could not publish the checkpoint."
+          fi
+          sudo rm -f /mnt/"${VM}-${DATE}".7z.* || true
+
+      - name: Tailscale cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo tailscale logout || true
+
+      - name: Trigger next machine (loop)
+        if: ${{ always() && !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ ! -f /mnt/bliss-ready ]; then
+            echo "::warning title=Auto-loop stopped::The VM did not boot, so no successor was dispatched."
+            exit 0
+          fi
+          LINK="${DOWNLOAD_LINK:-release:${TAG}}"
+          echo "Auto-loop: dispatching Bliss OS (source=$LINK)"
+          gh workflow run "Bliss OS" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            -f "vm_name=${VM}" \
+            -f "action=boot" \
+            -f "source_url=$LINK" \
+            -f "runtime=${RUNTIME}" \
+            -f "vnc_password=${VNC_PASSWORD}" 2>&1 | tee dispatch.log
+          if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "::notice title=Auto-loop::Next Bliss run queued."
+          else
+            echo "::warning title=Auto-loop failed::Could not dispatch the next run."
+          fi
