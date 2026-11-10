@@ -49,6 +49,7 @@ env:
   TAG: state-${{ github.event.inputs.vm_name || 'bliss' }}
   BLISS_ISO_PATH: "/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso"
   BLISS_ISO_SIZE: "2429550592"
+  VPS_TUNNEL_HOST: "129.151.173.224"
 
 jobs:
   bliss:
@@ -306,6 +307,40 @@ jobs:
             echo "::warning title=Guest not confirmed::No display activity detected; this run will not be checkpointed or looped. Connect to VNC to inspect."
           fi
 
+      - name: Expose VNC via public reverse tunnel
+        if: always()
+        continue-on-error: true
+        env:
+          VPS_TUNNEL_KEY: ${{ secrets.VPS_TUNNEL_KEY }}
+        run: |
+          set +e
+          if [ -z "$VPS_TUNNEL_KEY" ]; then
+            echo "::warning title=Public VNC skipped::VPS_TUNNEL_KEY secret not set"
+            exit 0
+          fi
+          printf '%s\n' "$VPS_TUNNEL_KEY" > /tmp/vps_tunnel
+          chmod 600 /tmp/vps_tunnel
+          cat > /tmp/vps_tunnel_loop.sh <<EOF
+          #!/bin/bash
+          while true; do
+            ssh -N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+              -o ExitOnForwardFailure=yes -i /tmp/vps_tunnel \
+              -R 0.0.0.0:5900:localhost:5900 opc@${VPS_TUNNEL_HOST}
+            sleep 5
+          done
+          EOF
+          chmod +x /tmp/vps_tunnel_loop.sh
+          nohup /tmp/vps_tunnel_loop.sh > /tmp/vps_tunnel.log 2>&1 &
+          sleep 8
+          BANNER=$(timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_TUNNEL_HOST/5900 && head -c 12 <&3" 2>/dev/null)
+          if [ "$BANNER" = "RFB 003.008" ] || [ -n "$BANNER" ]; then
+            echo "Public VNC reachable: $VPS_TUNNEL_HOST:5900"
+          else
+            echo "::warning title=Public VNC::Tunnel started but self-test failed; see /tmp/vps_tunnel.log"
+            tail -5 /tmp/vps_tunnel.log 2>/dev/null || true
+          fi
+
       - name: Connection info
         run: |
           TSIP="${TAILSCALE_IP}"
@@ -317,12 +352,14 @@ jobs:
             echo "Tailscale node: $SELF"
             echo "Tailscale IP: $TSIP"
             echo "VNC: $TSIP:5900 (or $SELF:5900) password ${{ env.VNC_PASSWORD }}"
+            echo "Public VNC: ${VPS_TUNNEL_HOST}:5900 (no Tailscale needed) password ${{ env.VNC_PASSWORD }}"
             echo "ADB: $TSIP:5555 (QEMU hostfwd to guest 5555)"
           } > connection.txt
           {
             echo "### Bliss OS"
             echo "- **Tailscale node:** \`$SELF\`"
             echo "- **VNC:** \`$TSIP:5900\` — password \`${{ env.VNC_PASSWORD }}\`"
+            echo "- **Public VNC (stable):** \`${VPS_TUNNEL_HOST}:5900\` — password \`${{ env.VNC_PASSWORD }}\`"
             echo "- **ADB:** \`$TSIP:5555\`"
           } >> $GITHUB_STEP_SUMMARY
           cat connection.txt
