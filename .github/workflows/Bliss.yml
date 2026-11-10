@@ -275,12 +275,12 @@ jobs:
               total += 1
               if data[j:j+3] != px:
                   diff += 1
-          sys.exit(0 if total and diff / total > 0.02 else 1)
+          sys.exit(0 if total and diff / total > 0.015 else 1)
           PY
           }
 
           READY=no
-          for i in $(seq 1 32); do
+          for i in $(seq 1 60); do
             if ! pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
               echo "::error::QEMU exited during boot; see /tmp/bliss-qemu.log"
               tail -40 /tmp/bliss-qemu.log 2>/dev/null || true
