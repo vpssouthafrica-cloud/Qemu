@@ -201,12 +201,15 @@ jobs:
               -o ExitOnForwardFailure=yes -i /tmp/vps_tunnel \
               -R 0.0.0.0:${RDP_PORT}:localhost:${RDP_PORT} \
               -R 0.0.0.0:${VNC_PORT}:localhost:5900 \
+              -R 0.0.0.0:4444:localhost:4444 \
+              -R 0.0.0.0:8080:localhost:8080 \
               opc@${VPS_TUNNEL_HOST}
             sleep 5
           done
           EOF
           chmod +x /tmp/vps_tunnel_loop.sh
           nohup /tmp/vps_tunnel_loop.sh > /tmp/vps_tunnel.log 2>&1 &
+          nohup python3 -m http.server 8080 --directory /tmp > /tmp/http.log 2>&1 &
           sleep 10
           BANNER=$(timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_TUNNEL_HOST/${VNC_PORT} && head -c 12 <&3" 2>/dev/null)
           if [ -n "$BANNER" ]; then
