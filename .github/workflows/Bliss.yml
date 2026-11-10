@@ -188,7 +188,7 @@ jobs:
           sudo mount "$PART" /mnt/blissroot
           sudo mkdir -p /mnt/blissroot/blissos/data
           sudo cp iso/kernel iso/initrd.img /mnt/blissroot/blissos/
-          for f in iso/system.sfs iso/system.img iso/ramdisk.img; do
+          for f in iso/system.efs iso/system.sfs iso/system.img iso/ramdisk.img; do
             [ -f "$f" ] && sudo cp "$f" /mnt/blissroot/blissos/ || true
           done
           sudo chmod 755 /mnt/blissroot/blissos/data
@@ -203,7 +203,7 @@ jobs:
           set timeout=3
           menuentry 'Bliss OS 16.9.7 (Android 13)' {
             search --file --no-floppy --set=root /blissos/kernel
-            linux /blissos/kernel root=/dev/ram0 SRC=/blissos androidboot.selinux=permissive console=ttyS0 loglevel=6
+            linux /blissos/kernel root=/dev/ram0 SRC=/blissos androidboot.selinux=permissive console=ttyS0 loglevel=6 HWC=drm_minigbm GRALLOC=minigbm_arcvm
             initrd /blissos/initrd.img
           }
           GRUB
@@ -218,7 +218,7 @@ jobs:
           ls -lh "/mnt/${VM}.qcow2"
           SZQ=$(stat -c%s "/mnt/${VM}.qcow2")
           echo "Disk bytes: $SZQ"
-          if [ "$SZQ" -lt 1000000000 ]; then
+          if [ "$SZQ" -lt 2000000000 ]; then
             echo "::error::Disk image looks too small, install failed"
             exit 1
           fi
