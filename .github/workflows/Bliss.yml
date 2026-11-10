@@ -47,7 +47,8 @@ env:
   RUNTIME: ${{ github.event.inputs.runtime || '270' }}
   VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'runner' }}
   TAG: state-${{ github.event.inputs.vm_name || 'bliss' }}
-  BLISS_ISO_URL: "https://downloads.sourceforge.net/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso"
+  BLISS_ISO_PATH: "/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso"
+  BLISS_ISO_SIZE: "2429550592"
 
 jobs:
   bliss:
@@ -70,7 +71,7 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             qemu-system-x86 qemu-utils p7zip-full curl wget jq e2fsprogs \
-            grub-pc-bin grub2-common xorriso netcat-openbsd util-linux >/dev/null
+            grub-pc-bin grub2-common xorriso netcat-openbsd util-linux aria2 >/dev/null
           qemu-system-x86_64 --version | head -n1
 
       - name: Setup Tailscale
@@ -142,13 +143,27 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$WORK"
           cd "$WORK"
 
-          echo "Downloading Bliss OS 16.9.7 ISO..."
-          rm -f bliss.iso
-          timeout 1800 curl -L --retry 3 --connect-timeout 20 -o bliss.iso "$BLISS_ISO_URL"
-          ls -lh bliss.iso
-          SZ=$(stat -c%s bliss.iso)
+          echo "Downloading Bliss OS 16.9.7 ISO (multi-connection, mirror failover)..."
+          rm -f bliss.iso bliss.iso.aria2
+          timeout 3000 aria2c -x 16 -s 16 -k 1M --file-allocation=none \
+            --max-tries=6 --retry-wait=5 --timeout=60 --connect-timeout=20 \
+            --console-log-level=warn --summary-interval=30 \
+            -d "$WORK" -o bliss.iso \
+            "https://gigenet.dl.sourceforge.net${BLISS_ISO_PATH}" \
+            "https://phoenixnap.dl.sourceforge.net${BLISS_ISO_PATH}" \
+            "https://cfhcable.dl.sourceforge.net${BLISS_ISO_PATH}" || true
+          SZ=$(stat -c%s bliss.iso 2>/dev/null || echo 0)
           echo "ISO bytes: $SZ"
-          if [ "$SZ" -lt 2000000000 ]; then echo "::error::ISO download looks truncated"; exit 1; fi
+          if [ "$SZ" -ne "$BLISS_ISO_SIZE" ]; then
+            echo "aria2 incomplete ($SZ), falling back to the SourceForge redirector..."
+            rm -f bliss.iso
+            timeout 3000 curl -L --retry 5 --connect-timeout 20 -C - \
+              -o bliss.iso "https://downloads.sourceforge.net${BLISS_ISO_PATH}" || true
+            SZ=$(stat -c%s bliss.iso 2>/dev/null || echo 0)
+            echo "ISO bytes after fallback: $SZ"
+          fi
+          ls -lh bliss.iso
+          if [ "$SZ" -ne "$BLISS_ISO_SIZE" ]; then echo "::error::ISO download incomplete"; exit 1; fi
 
           echo "Extracting kernel / initrd / system image..."
           rm -rf iso
