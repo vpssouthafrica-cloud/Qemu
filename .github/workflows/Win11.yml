@@ -251,7 +251,7 @@ jobs:
           set -e
           MODE="$1"
           DISK="$2"
-          ARGS=(-enable-kvm -cpu host -smp 4 -m 6G -machine q35
+          ARGS=(-enable-kvm -cpu host -smp 4,sockets=1,cores=4,threads=1 -m 12G -machine q35
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
             -drive if=pflash,format=raw,file=/mnt/OVMF_VARS.fd
             -chardev socket,id=chrtpm,path=/tmp/swtpm.sock
