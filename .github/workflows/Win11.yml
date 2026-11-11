@@ -467,6 +467,15 @@ jobs:
         run: |
           set +e
           if [ ! -f "/mnt/${VM}-ready" ]; then
+            if [ "${{ job.status }}" = "failure" ]; then
+              echo "::warning title=Boot failed::Retrying automatically in 10 minutes."
+              sleep 600
+              LINK="${DOWNLOAD_LINK:-release:${TAG}}"
+              gh workflow run "Windows 11" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+                -f "vm_name=${VM}" -f "action=boot" -f "source_url=$LINK" \
+                -f "runtime=${RUNTIME}" -f "vnc_password=${VNC_PASSWORD}" || true
+              exit 0
+            fi
             echo "::warning title=Auto-loop stopped::Windows did not come up, so no successor was dispatched."
             exit 0
           fi
