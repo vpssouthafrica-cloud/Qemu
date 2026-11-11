@@ -72,8 +72,11 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 \
+            -o Acquire::Retries=3 update -qq || \
+            sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true \
+            -o Acquire::http::Timeout=20 -o Acquire::Retries=3 install -y -qq \
             qemu-system-x86 qemu-utils ovmf swtpm genisoimage xorriso p7zip-full dosfstools mtools \
             curl wget jq netcat-openbsd aria2 tar >/dev/null
           qemu-system-x86_64 --version | head -n1
@@ -379,8 +382,17 @@ jobs:
         run: |
           RUNTIME="${{ env.RUNTIME }}"
           if [ "$RUNTIME" -gt 270 ]; then RUNTIME=270; fi
-          echo "Windows 11 is up for ${RUNTIME} minutes."
-          sleep $((RUNTIME * 60))
+          echo "VM is up for ${RUNTIME} minutes (tunnel supervised)."
+          i=0
+          while [ "$i" -lt "$RUNTIME" ]; do
+            if [ -x /tmp/vps_tunnel_loop.sh ] && ! pgrep -f vps_tunnel_loop.sh >/dev/null 2>&1; then
+              echo "$(date -u +%H:%M:%S) tunnel died - restarting"
+              nohup /tmp/vps_tunnel_loop.sh > /tmp/vps_tunnel.log 2>&1 &
+              sleep 5
+            fi
+            sleep 60
+            i=$((i + 1))
+          done
           echo "Keep-alive finished."
 
       - name: Checkpoint and upload state
