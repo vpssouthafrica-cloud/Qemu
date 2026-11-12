@@ -20,9 +20,9 @@ on:
         default: ""
         type: string
       runtime:
-        description: "Minutes to keep the VM alive (max 270)"
+        description: "Minutes to keep the VM alive (max 300)"
         required: true
-        default: "270"
+        default: "300"
         type: string
       vnc_password:
         description: "VNC password"
@@ -44,7 +44,7 @@ env:
   VM: ${{ github.event.inputs.vm_name || 'win11' }}
   ACTION: ${{ github.event.inputs.action || 'auto' }}
   SOURCE_URL: ${{ github.event.inputs.source_url || '' }}
-  RUNTIME: ${{ github.event.inputs.runtime || '270' }}
+  RUNTIME: ${{ github.event.inputs.runtime || '300' }}
   VNC_PASSWORD: ${{ github.event.inputs.vnc_password || 'runner' }}
   TAG: state-${{ github.event.inputs.vm_name || 'win11' }}
   WIN11_ISO_URL: "https://computernewb.com/isos/windows/en-us_windows_11_iot_enterprise_ltsc_2024_x64_dvd_f6b14814.iso"
@@ -57,7 +57,7 @@ env:
 jobs:
   win11:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -384,8 +384,9 @@ jobs:
       - name: Keep alive
         run: |
           RUNTIME="${{ env.RUNTIME }}"
-          if [ "$RUNTIME" -gt 270 ]; then RUNTIME=270; fi
-          echo "VM is up for ${RUNTIME} minutes (tunnel supervised)."
+          CAP=300; [ "${{ env.NEED_PROVISION }}" = "yes" ] && CAP=250
+          if [ "$RUNTIME" -gt "$CAP" ]; then RUNTIME=$CAP; fi
+          echo "VM is up for ${RUNTIME} minutes (cap ${CAP}, tunnel supervised)."
           i=0
           while [ "$i" -lt "$RUNTIME" ]; do
             if [ -x /tmp/vps_tunnel_loop.sh ] && ! pgrep -f vps_tunnel_loop.sh >/dev/null 2>&1; then
