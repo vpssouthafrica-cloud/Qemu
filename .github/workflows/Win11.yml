@@ -53,6 +53,7 @@ env:
   RDP_PORT: "3389"
   VNC_PORT: "5901"
   DISK_GB: "64"
+  AGE_RECIPIENT: age1dxxn0hztaf00zafvmvne2h6wmud6wvh3enehcps279xla7fzqy8se90u0e
 
 jobs:
   win11:
@@ -60,6 +61,19 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare state encryption key
+        env:
+          AGE_KEY: ${{ secrets.AGE_KEY }}
+        run: |
+          if [ -z "${AGE_KEY:-}" ]; then
+            echo "::warning title=AGE_KEY missing::Checkpoints will not be saved; add the AGE_KEY secret."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$AGE_KEY" > /tmp/age.key
+          chmod 600 /tmp/age.key
+          echo "AGE_KEY_FILE=/tmp/age.key" >> "$GITHUB_ENV"
 
       - name: Free disk space
         run: |
@@ -81,7 +95,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true \
             -o Acquire::http::Timeout=20 -o Acquire::Retries=3 install -y -qq \
             qemu-system-x86 qemu-utils ovmf swtpm genisoimage xorriso p7zip-full dosfstools mtools \
-            curl wget jq netcat-openbsd aria2 tar >/dev/null
+            curl wget jq netcat-openbsd aria2 tar zstd age >/dev/null
           qemu-system-x86_64 --version | head -n1
           swtpm --version | head -n1
           ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd
@@ -107,7 +121,7 @@ jobs:
           HAVE=no
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             if gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
-                 | grep -qE "^${VM}-[0-9]{8}-[0-9]{4}\.7z\.001"; then
+                 | grep -qE "^${VM}-[0-9]{8}-[0-9]{4}\.(qcow2\.zst\.(age\.)?001|7z\.001)"; then
               HAVE=yes
             fi
           fi
@@ -131,9 +145,32 @@ jobs:
           sudo chown "$(id -u):$(id -g)" /mnt/dl
           cd /mnt/dl
           echo "Restoring $TAG ..."
-          gh release download "$TAG" --repo "${{ github.repository }}" --clobber
-          FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
-          if [ -n "$FIRST" ]; then sudo 7z x -y "$FIRST" -o/mnt >/dev/null; fi
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
+            | xargs -P 6 -I{} gh release download "$TAG" --repo "${{ github.repository }}" --clobber -p "{}"
+          AFIRST=$(ls -1 "${VM}"-*.qcow2.zst.age.001 2>/dev/null | head -n1 || true)
+          ZFIRST=$(ls -1 "${VM}"-*.qcow2.zst.001 2>/dev/null | head -n1 || true)
+          if [ -n "$AFIRST" ]; then
+            if [ -z "${AGE_KEY_FILE:-}" ]; then
+              echo "::error::Encrypted checkpoint found but the AGE_KEY secret is missing."
+              exit 1
+            fi
+            echo "Decrypting encrypted checkpoint..."
+            cat "${VM}"-*.qcow2.zst.age.* | age -d -i "$AGE_KEY_FILE" | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2"
+            AOV=$(ls -1 "${VM}"-*.OVMF_VARS.fd.zst.age 2>/dev/null | head -n1 || true)
+            if [ -n "$AOV" ]; then age -d -i "$AGE_KEY_FILE" "$AOV" | sudo zstd -d -T0 -q -o /mnt/OVMF_VARS.fd; fi
+            ATPM=$(ls -1 "${VM}"-*.swtpm-state.tar.zst.age 2>/dev/null | head -n1 || true)
+            if [ -n "$ATPM" ]; then age -d -i "$AGE_KEY_FILE" "$ATPM" | sudo zstd -d -T0 -q -o /mnt/swtpm-state.tar; fi
+          elif [ -n "$ZFIRST" ]; then
+            echo "Decompressing zstd checkpoint..."
+            cat "${VM}"-*.qcow2.zst.* | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2"
+            ZOV=$(ls -1 "${VM}"-*.OVMF_VARS.fd.zst 2>/dev/null | head -n1 || true)
+            if [ -n "$ZOV" ]; then sudo zstd -d -T0 -q -f "$ZOV" -o /mnt/OVMF_VARS.fd; fi
+            ZTPM=$(ls -1 "${VM}"-*.swtpm-state.tar.zst 2>/dev/null | head -n1 || true)
+            if [ -n "$ZTPM" ]; then sudo zstd -d -T0 -q -f "$ZTPM" -o /mnt/swtpm-state.tar; fi
+          else
+            FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+            if [ -n "$FIRST" ]; then sudo 7z x -y "$FIRST" -o/mnt >/dev/null; fi
+          fi
           if [ ! -f "/mnt/${VM}.qcow2" ]; then
             QC=$(sudo find /mnt -maxdepth 4 -name "${VM}.qcow2" 2>/dev/null | head -n1)
             if [ -n "$QC" ]; then sudo mv "$QC" "/mnt/${VM}.qcow2"; fi
@@ -142,6 +179,7 @@ jobs:
             echo "::error::Could not restore ${VM}.qcow2 from $TAG"
             exit 1
           fi
+          sudo qemu-img info "/mnt/${VM}.qcow2" >/dev/null 2>&1 || { echo "::error::Restored image failed qemu-img verification"; exit 1; }
           sudo qemu-img resize "/mnt/${VM}.qcow2" "${DISK_GB}G" >/dev/null 2>&1 || true
           echo "Restored /mnt/${VM}.qcow2"
           sudo ls -lh /mnt/OVMF_VARS.fd /mnt/swtpm-state.tar 2>/dev/null || true
@@ -431,30 +469,45 @@ jobs:
             sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"
           fi
           DATE=$(date -u +%Y%m%d-%H%M)
-          BASE="${VM}-${DATE}.7z"
-          echo "Compressing in 1800 MB volumes..."
-          FILES=("${VM}.qcow2")
-          [ -f /mnt/OVMF_VARS.fd ] && FILES+=("OVMF_VARS.fd")
-          [ -f /mnt/swtpm-state.tar ] && FILES+=("swtpm-state.tar")
-          ( cd /mnt && sudo 7z a -t7z -mx=3 -v1800m "/mnt/${BASE}" "${FILES[@]}" >/dev/null )
-          sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}".7z.* 2>/dev/null || true
-          ls -lh /mnt/"${VM}-${DATE}".7z.* | awk '{print $9, $5}'
+          if [ -z "${AGE_KEY_FILE:-}" ] || [ -z "${AGE_RECIPIENT:-}" ]; then
+            echo "::error title=State not saved::AGE_KEY/AGE_RECIPIENT missing; refusing to publish an unencrypted disk."
+            exit 1
+          fi
+          echo "Compressing (zstd) and encrypting (age) the disk..."
+          sudo VM="$VM" DATE="$DATE" R="$AGE_RECIPIENT" sh -c \
+            'zstd -T0 -3 -q -c "/mnt/$VM.qcow2" | age -r "$R" -o "/mnt/$VM-$DATE.qcow2.zst.age"'
+          sudo split -b 1800M -d -a 3 "/mnt/${VM}-${DATE}.qcow2.zst.age" "/mnt/${VM}-${DATE}.qcow2.zst.age."
+          sudo rm -f "/mnt/${VM}-${DATE}.qcow2.zst.age"
+          for f in OVMF_VARS.fd swtpm-state.tar; do
+            if [ -f "/mnt/$f" ]; then
+              sudo VM="$VM" DATE="$DATE" F="$f" R="$AGE_RECIPIENT" sh -c \
+                'zstd -T0 -3 -q -c "/mnt/$F" | age -r "$R" -o "/mnt/$VM-$DATE.$F.zst.age"'
+            fi
+          done
+          sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}".* 2>/dev/null || true
+          ls -lh /mnt/"${VM}-${DATE}".* | awk '{print $9, $5}'
           gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "${{ github.repository }}" \
               --title "Vortax state: ${VM}" \
               --notes "Rolling Windows 11 disk checkpoints for ${VM}. Newest timestamp is current state."
-          if gh release upload "$TAG" /mnt/"${VM}-${DATE}".7z.* --repo "${{ github.repository }}" --clobber; then
-            echo "State saved under $TAG ($DATE)."
+          ls -1 /mnt/"${VM}-${DATE}".qcow2.zst.age.* | xargs -P 4 -I{} gh release upload "$TAG" "{}" --repo "${{ github.repository }}" --clobber
+          for f in /mnt/"${VM}-${DATE}".OVMF_VARS.fd.zst.age /mnt/"${VM}-${DATE}".swtpm-state.tar.zst.age; do
+            if [ -f "$f" ]; then gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber; fi
+          done
+          PARTS=$(ls -1 /mnt/"${VM}-${DATE}".qcow2.zst.age.* | wc -l)
+          UPLOADED=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' | grep -c "^${VM}-${DATE}\.qcow2\.zst\.age\." || true)
+          if [ "$PARTS" -gt 0 ] && [ "$UPLOADED" -eq "$PARTS" ]; then
+            echo "State saved under $TAG ($DATE, ${PARTS} parts)."
             echo "DOWNLOAD_LINK=release:${TAG}" >> $GITHUB_ENV
             echo "release:${TAG}" > disk_link.txt
             gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' \
-              | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.7z" \
-              | grep -v "^${VM}-${DATE}\.7z" \
+              | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\." \
+              | grep -v "^${VM}-${DATE}\." \
               | while read -r a; do gh release delete-asset "$TAG" "$a" --repo "${{ github.repository }}" -y >/dev/null 2>&1 || true; done
           else
-            echo "::warning title=State upload failed::Could not publish the checkpoint."
+            echo "::warning title=State upload failed::Checkpoint parts ${UPLOADED}/${PARTS} present on the release."
           fi
-          sudo rm -f /mnt/"${VM}-${DATE}".7z.* || true
+          sudo rm -f /mnt/"${VM}-${DATE}".* || true
           sudo rm -f /mnt/win11.iso /mnt/unattend.iso 2>/dev/null || true
 
       - name: Tailscale cleanup
